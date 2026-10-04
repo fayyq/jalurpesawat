@@ -3,187 +3,157 @@ import pandas as pd
 import numpy as np
 import requests
 import plotly.graph_objects as go
-from io import StringIO
+from datetime import date, timedelta
 
 
 # ============================================================
-# KONFIGURASI HALAMAN
+# KONFIGURASI DASHBOARD
 # ============================================================
 
 st.set_page_config(
-    page_title="Dashboard Hotspot Kebakaran Indonesia",
+    page_title="Dashboard Hotspot Indonesia",
     page_icon="🔥",
     layout="wide"
 )
 
+st.title("🔥 Dashboard Analisis Hotspot Kebakaran Indonesia")
+
+st.markdown("""
+Dashboard ini menganalisis data hotspot kebakaran Indonesia dari
+**NASA FIRMS** menggunakan **Bagan Kendali c' Laney** sebagai
+metode utama, serta **Z-Score, Moving Average, dan deteksi pola**
+sebagai analisis pendukung.
+""")
+
+st.divider()
+
 
 # ============================================================
-# KONFIGURASI DATA
+# NASA FIRMS
 # ============================================================
 
-SENSOR = "VIIRS_SNPP_NRT"
+SENSOR = "VIIRS_NOAA21_NRT"
+
+# Batas wilayah Indonesia
 AREA = "95,-11,141,6"
 
 
 # ============================================================
-# MAP KEY DARI STREAMLIT SECRETS
+# AMBIL MAP KEY DARI SECRETS
 # ============================================================
 
 try:
     MAP_KEY = st.secrets["FIRMS_MAP_KEY"]
 except Exception:
-    MAP_KEY = None
+    MAP_KEY = ""
 
 
 if not MAP_KEY:
-    st.error(
-        "❌ MAP_KEY NASA FIRMS belum dikonfigurasi."
-    )
+    st.error("❌ MAP_KEY NASA FIRMS belum dikonfigurasi.")
 
-    st.info(
-        "Tambahkan FIRMS_MAP_KEY pada "
-        "Streamlit Secrets."
-    )
+    st.info("""
+Tambahkan MAP_KEY NASA FIRMS pada:
+
+`.streamlit/secrets.toml`
+
+dengan format:
+
+FIRMS_MAP_KEY = "MAP_KEY_KAMU"
+""")
 
     st.stop()
 
 
 # ============================================================
-# SIDEBAR
+# SIDEBAR PARAMETER
 # ============================================================
 
-st.sidebar.title("⚙️ Pengaturan Analisis")
-
-st.sidebar.markdown(
-    """
-    Atur parameter analisis menggunakan
-    pilihan di bawah ini.
-    """
-)
-
+st.sidebar.header("⚙️ Parameter Analisis")
 
 HARI_MUNDUR = st.sidebar.slider(
-    "📅 Periode Data (hari)",
-    min_value=7,
-    max_value=365,
-    value=60,
-    step=1
+    "Periode Data (hari)",
+    min_value=10,
+    max_value=60,
+    value=30,
+    step=5
 )
 
-
 BASELINE_DAYS = st.sidebar.slider(
-    "📊 Baseline c' Laney (hari)",
+    "Baseline c' Laney (hari)",
     min_value=7,
-    max_value=60,
+    max_value=30,
     value=30,
     step=1
 )
 
-
 SIGMA_K = st.sidebar.slider(
-    "📐 Nilai Sigma",
+    "Konstanta Batas Kendali (k)",
     min_value=1.0,
     max_value=4.0,
     value=3.0,
     step=0.5
 )
 
-
 WINDOW_SIZE = st.sidebar.slider(
-    "📈 Window Moving Average",
+    "Moving Average",
     min_value=3,
-    max_value=30,
+    max_value=14,
     value=7,
     step=1
 )
 
-
 Z_THRESH = st.sidebar.slider(
-    "⚠️ Threshold Z-Score",
+    "Z-Score Threshold",
     min_value=1.0,
-    max_value=4.0,
+    max_value=3.0,
     value=2.0,
     step=0.1
 )
 
-
 MIN_CONSECUTIVE = st.sidebar.slider(
-    "⏱️ Minimum Durasi Anomali",
+    "Minimum Hari Berurutan",
     min_value=2,
-    max_value=10,
+    max_value=7,
     value=3,
     step=1
 )
-
 
 TREND_LEN = st.sidebar.slider(
-    "📉 Panjang Trend",
+    "Panjang Deteksi Tren",
     min_value=2,
-    max_value=10,
+    max_value=7,
     value=3,
     step=1
 )
 
 
 # ============================================================
-# JUDUL DASHBOARD
-# ============================================================
-
-st.title(
-    "🔥 Dashboard Analisis Hotspot Kebakaran Indonesia"
-)
-
-st.markdown(
-    """
-    Dashboard ini menganalisis data hotspot kebakaran
-    Indonesia dari **NASA FIRMS** menggunakan
-    **Bagan Kendali c' Laney**, **Z-Score**, dan
-    deteksi pola.
-    """
-)
-
-st.divider()
-
-
-# ============================================================
-# FUNGSI MENGAMBIL DATA NASA FIRMS
+# FUNGSI AMBIL DATA NASA FIRMS
 # ============================================================
 
 @st.cache_data(ttl=600)
-def tarik_firms(
-    map_key,
-    sensor,
-    area,
-    hari_mundur
-):
+def tarik_firms(map_key, sensor, area, hari_mundur):
 
-    akhir = pd.Timestamp.today().normalize()
+    tanggal_akhir = date.today()
+    tanggal_awal = tanggal_akhir - timedelta(days=hari_mundur - 1)
 
-    awal = (
-        akhir
-        - pd.Timedelta(
-            days=hari_mundur
+    seluruh_data = []
+
+    # NASA FIRMS Area API menggunakan maksimal 5 hari per request
+    tanggal_mulai = tanggal_awal
+
+    while tanggal_mulai <= tanggal_akhir:
+
+        tanggal_selesai = min(
+            tanggal_mulai + timedelta(days=4),
+            tanggal_akhir
         )
-    )
-
-    semua_data = []
-
-    # Pengambilan data per 10 hari
-    chunk = 10
-
-    tanggal_list = pd.date_range(
-        awal,
-        akhir,
-        freq=f"{chunk}D"
-    )
-
-    for tgl in tanggal_list:
 
         url = (
-            "https://firms.modaps.eosdis.nasa.gov/"
-            f"api/area/csv/{map_key}/"
-            f"{sensor}/{area}/{chunk}/"
-            f"{tgl:%Y-%m-%d}"
+            f"https://firms.modaps.eosdis.nasa.gov/api/area/"
+            f"csv/{map_key}/{sensor}/{area}/"
+            f"{(tanggal_selesai - tanggal_mulai).days + 1}/"
+            f"{tanggal_mulai.strftime('%Y-%m-%d')}"
         )
 
         try:
@@ -194,35 +164,74 @@ def tarik_firms(
             )
 
             if response.status_code != 200:
-                continue
 
-            if not response.text.strip():
-                continue
+                st.warning(
+                    f"""
+⚠️ NASA FIRMS gagal mengambil data
+{tanggal_mulai} sampai {tanggal_selesai}
 
-            data = pd.read_csv(
-                StringIO(
-                    response.text
+HTTP Status: {response.status_code}
+
+Response:
+{response.text[:300]}
+"""
                 )
+
+            else:
+
+                from io import StringIO
+
+                df = pd.read_csv(
+                    StringIO(response.text)
+                )
+
+                if not df.empty:
+                    seluruh_data.append(df)
+
+        except Exception as e:
+
+            st.warning(
+                f"""
+⚠️ Terjadi kesalahan saat mengambil data
+{tanggal_mulai} sampai {tanggal_selesai}
+
+Error:
+{e}
+"""
             )
 
-            if not data.empty:
-                semua_data.append(data)
+        tanggal_mulai = tanggal_selesai + timedelta(days=1)
 
-        except Exception:
-            continue
-
-
-    # Tidak ada data
-    if not semua_data:
+    if not seluruh_data:
         return pd.DataFrame()
 
-
-    # Gabungkan seluruh data
     df = pd.concat(
-        semua_data,
+        seluruh_data,
         ignore_index=True
     )
 
+    return df
+
+
+# ============================================================
+# AGREGASI HARIAN
+# ============================================================
+
+def agregasi_harian(df):
+
+    df = df.copy()
+
+    if "acq_date" not in df.columns:
+        return pd.DataFrame()
+
+    df["tanggal"] = pd.to_datetime(
+        df["acq_date"],
+        errors="coerce"
+    )
+
+    df = df.dropna(
+        subset=["tanggal"]
+    )
 
     # ========================================================
     # FILTER CONFIDENCE
@@ -248,55 +257,9 @@ def tarik_firms(
             )
         ]
 
-
     # ========================================================
-    # FORMAT TANGGAL
+    # HITUNG JUMLAH HOTSPOT PER HARI
     # ========================================================
-
-    if "acq_date" in df.columns:
-
-        df["tanggal"] = pd.to_datetime(
-            df["acq_date"],
-            errors="coerce"
-        )
-
-    else:
-
-        return pd.DataFrame()
-
-
-    df = df.dropna(
-        subset=["tanggal"]
-    )
-
-
-    df = df.sort_values(
-        "tanggal"
-    )
-
-
-    # Hilangkan duplikasi
-    df = df.drop_duplicates()
-
-
-    return df
-
-
-# ============================================================
-# AGREGASI DATA HARIAN
-# ============================================================
-
-def agregasi_harian(df):
-
-    if df.empty:
-
-        return pd.DataFrame(
-            columns=[
-                "tanggal",
-                "hotspot"
-            ]
-        )
-
 
     harian = (
         df.groupby("tanggal")
@@ -306,33 +269,129 @@ def agregasi_harian(df):
         )
     )
 
-
-    harian = harian.sort_values(
+    return harian.sort_values(
         "tanggal"
+    ).reset_index(
+        drop=True
     )
 
 
-    return harian
+# ============================================================
+# c' LANEY
+# ============================================================
+
+def batas_kendali_laney(
+    df,
+    baseline_days=30,
+    k=3
+):
+
+    df = df.copy()
+
+    if len(df) < 2:
+        return df
+
+    # --------------------------------------------------------
+    # Baseline
+    # --------------------------------------------------------
+
+    baseline = df[
+        "hotspot"
+    ].tail(
+        min(
+            baseline_days,
+            len(df)
+        )
+    )
+
+    cbar = baseline.mean()
+
+    if cbar <= 0:
+        cbar = 1
+
+    # --------------------------------------------------------
+    # Transformasi Z Laney
+    # --------------------------------------------------------
+
+    df["z_laney"] = (
+        df["hotspot"] - cbar
+    ) / np.sqrt(cbar)
+
+    # --------------------------------------------------------
+    # Moving Range
+    # --------------------------------------------------------
+
+    df["MR"] = (
+        df["z_laney"]
+        .diff()
+        .abs()
+    )
+
+    mr_bar = df["MR"].mean()
+
+    if pd.isna(mr_bar) or mr_bar == 0:
+        sigma_z = 1
+    else:
+        sigma_z = mr_bar / 1.128
+
+    # --------------------------------------------------------
+    # Batas kendali pada skala Z
+    # --------------------------------------------------------
+
+    ucl_z = k * sigma_z
+    lcl_z = -k * sigma_z
+
+    # --------------------------------------------------------
+    # Kembali ke skala hotspot
+    # --------------------------------------------------------
+
+    simpangan = (
+        sigma_z *
+        np.sqrt(cbar)
+    )
+
+    ucl = cbar + k * simpangan
+    lcl = cbar - k * simpangan
+
+    lcl = max(
+        0,
+        lcl
+    )
+
+    # --------------------------------------------------------
+    # Simpan batas kendali
+    # --------------------------------------------------------
+
+    df["CL"] = cbar
+    df["UCL"] = ucl
+    df["LCL"] = lcl
+
+    # --------------------------------------------------------
+    # ANOMALI UTAMA
+    # --------------------------------------------------------
+
+    df["anomali_laney"] = (
+        (df["hotspot"] > df["UCL"]) |
+        (df["hotspot"] < df["LCL"])
+    )
+
+    return df
 
 
 # ============================================================
-# FUNGSI MENGHITUNG DURASI TRUE BERTURUT-TURUT
+# DETEKSI CONSECUTIVE
 # ============================================================
 
 def consecutive_true_count(series):
 
     hasil = []
-
     count = 0
 
     for value in series:
 
-        if bool(value):
-
+        if value:
             count += 1
-
         else:
-
             count = 0
 
         hasil.append(count)
@@ -341,24 +400,31 @@ def consecutive_true_count(series):
 
 
 # ============================================================
-# FUNGSI MENGHITUNG RUN TREND
+# DETEKSI POLA ARAH
 # ============================================================
 
 def consecutive_same_sign(series):
 
     hasil = []
 
-    count = 0
-
     previous = None
+    count = 0
 
     for value in series:
 
-        if value == 0:
+        if value > 0:
 
-            count = 0
+            current = "naik"
 
-        elif value == previous:
+        elif value < 0:
+
+            current = "turun"
+
+        else:
+
+            current = "netral"
+
+        if current == previous:
 
             count += 1
 
@@ -366,129 +432,72 @@ def consecutive_same_sign(series):
 
             count = 1
 
-        hasil.append(count)
+        hasil.append(
+            f"{current} ({count})"
+        )
 
-        previous = value
+        previous = current
 
     return hasil
 
 
 # ============================================================
-# BAGAN KENDALI c' LANEY
-# ============================================================
-
-def batas_kendali_laney(
-    harian,
-    baseline_days=30,
-    k=3
-):
-
-    df = harian.copy()
-
-
-    # Data baseline
-    baseline = (
-        df["hotspot"]
-        .tail(baseline_days)
-    )
-
-
-    cbar = baseline.mean()
-
-
-    if pd.isna(cbar) or cbar <= 0:
-        cbar = 1
-
-
-    # Standardisasi
-    z = (
-        df["hotspot"] - cbar
-    ) / np.sqrt(cbar)
-
-
-    # Estimasi sigma
-    sigma_z = (
-        z.diff()
-        .abs()
-        .mean()
-        / 1.128
-    )
-
-
-    if (
-        pd.isna(sigma_z)
-        or sigma_z <= 0
-    ):
-
-        sigma_z = 1
-
-
-    # Lebar batas kendali
-    lebar = (
-        k
-        * np.sqrt(cbar)
-        * sigma_z
-    )
-
-
-    CL = cbar
-
-    UCL = (
-        cbar
-        + lebar
-    )
-
-    LCL = max(
-        0,
-        cbar - lebar
-    )
-
-
-    # Simpan ke dataframe
-
-    df["CL"] = CL
-
-    df["UCL"] = UCL
-
-    df["LCL"] = LCL
-
-
-    # Anomali Laney
-
-    df["anomali_laney"] = (
-        (df["hotspot"] > UCL)
-        |
-        (df["hotspot"] < LCL)
-    )
-
-
-    return df
-
-
-# ============================================================
-# ANALISIS STATISTIK
+# ANALISIS UTAMA
 # ============================================================
 
 def analisis(
-    harian,
+    df,
     baseline_days,
-    sigma_k,
+    k,
     window_size,
     z_thresh,
     min_consecutive,
     trend_len
 ):
 
+    df = df.copy()
+
+    # --------------------------------------------------------
+    # c' LANEY
+    # --------------------------------------------------------
+
     df = batas_kendali_laney(
-        harian,
+        df,
         baseline_days,
-        sigma_k
+        k
     )
 
+    # --------------------------------------------------------
+    # Z-SCORE
+    # --------------------------------------------------------
 
-    # ========================================================
+    mean_hotspot = df[
+        "hotspot"
+    ].mean()
+
+    std_hotspot = df[
+        "hotspot"
+    ].std()
+
+    if pd.isna(std_hotspot) or std_hotspot == 0:
+
+        df["z_score"] = 0
+
+    else:
+
+        df["z_score"] = (
+            df["hotspot"] -
+            mean_hotspot
+        ) / std_hotspot
+
+    df["anomali_z"] = (
+        df["z_score"].abs() >
+        z_thresh
+    )
+
+    # --------------------------------------------------------
     # MOVING AVERAGE
-    # ========================================================
+    # --------------------------------------------------------
 
     df["moving_average"] = (
         df["hotspot"]
@@ -499,146 +508,105 @@ def analisis(
         .mean()
     )
 
+    # --------------------------------------------------------
+    # SELISIH DARI MOVING AVERAGE
+    # --------------------------------------------------------
 
-    # ========================================================
-    # Z-SCORE
-    # ========================================================
-
-    mean_hotspot = (
-        df["hotspot"].mean()
+    df["selisih_ma"] = (
+        df["hotspot"] -
+        df["moving_average"]
     )
 
+    # --------------------------------------------------------
+    # CONSECUTIVE ANOMALI LANEY
+    # --------------------------------------------------------
 
-    std_hotspot = (
-        df["hotspot"].std()
-    )
-
-
-    if (
-        pd.isna(std_hotspot)
-        or std_hotspot == 0
-    ):
-
-        std_hotspot = 1
-
-
-    df["z_score"] = (
-        df["hotspot"]
-        - mean_hotspot
-    ) / std_hotspot
-
-
-    df["anomali_z"] = (
-        df["z_score"].abs()
-        > z_thresh
-    )
-
-
-    # ========================================================
-    # DURASI ANOMALI
-    # ========================================================
-
-    df["durasi_anomali"] = (
+    df["consecutive_laney"] = (
         consecutive_true_count(
-            df["anomali_z"]
+            df["anomali_laney"]
         )
     )
 
-
-    df["anomali_durasi"] = (
-        df["durasi_anomali"]
-        >= min_consecutive
+    df["pola_laney"] = (
+        df["consecutive_laney"] >=
+        min_consecutive
     )
 
+    # --------------------------------------------------------
+    # DETEKSI ARAH
+    # --------------------------------------------------------
 
-    # ========================================================
-    # TREND
-    # ========================================================
-
-    df["selisih"] = (
-        df["hotspot"].diff()
+    df["perubahan"] = (
+        df["hotspot"]
+        .diff()
     )
 
-
-    df["arah"] = np.where(
-        df["selisih"] > 0,
-        1,
-        np.where(
-            df["selisih"] < 0,
-            -1,
-            0
-        )
-    )
-
-
-    df["run_trend"] = (
+    df["arah"] = (
         consecutive_same_sign(
-            df["arah"]
+            df["perubahan"]
+            .fillna(0)
         )
     )
 
+    # --------------------------------------------------------
+    # TREND
+    # --------------------------------------------------------
 
-    df["trend_naik"] = (
-        (df["arah"] == 1)
-        &
-        (
-            df["run_trend"]
-            >= trend_len
-        )
-    )
-
-
-    df["trend_turun"] = (
-        (df["arah"] == -1)
-        &
-        (
-            df["run_trend"]
-            >= trend_len
-        )
-    )
-
-
-    # ========================================================
-    # SEQUENCE
-    # ========================================================
-
-    df["sequence"] = (
-        df["anomali_z"]
-        .rolling(
-            window=3,
-            min_periods=1
-        )
-        .sum()
-    )
-
-
-    # ========================================================
-    # KORELASI
-    # ========================================================
-
-    df["correlation"] = (
+    df["trend"] = (
         df["hotspot"]
         .rolling(
-            window=window_size
+            window=trend_len,
+            min_periods=trend_len
         )
-        .corr(
-            df["moving_average"]
+        .apply(
+            lambda x:
+            np.polyfit(
+                np.arange(len(x)),
+                x,
+                1
+            )[0]
+            if len(x) >= 2
+            else 0
         )
     )
 
+    # --------------------------------------------------------
+    # KATEGORI TREND
+    # --------------------------------------------------------
+
+    df["kategori_trend"] = np.select(
+        [
+            df["trend"] > 0,
+            df["trend"] < 0
+        ],
+        [
+            "Meningkat",
+            "Menurun"
+        ],
+        default="Stabil"
+    )
+
+    # --------------------------------------------------------
+    # ANOMALI GABUNGAN
+    # --------------------------------------------------------
+
+    df["anomali_gabungan"] = (
+        df["anomali_laney"] |
+        df["anomali_z"]
+    )
 
     return df
 
 
 # ============================================================
-# MENGAMBIL DATA
+# AMBIL DATA
 # ============================================================
 
 with st.spinner(
-    "⏳ Mengambil data hotspot dari NASA FIRMS..."
+    "🔥 Mengambil data hotspot dari NASA FIRMS..."
 ):
 
-    raw_data = tarik_firms(
+    data_raw = tarik_firms(
         MAP_KEY,
         SENSOR,
         AREA,
@@ -650,39 +618,39 @@ with st.spinner(
 # CEK DATA
 # ============================================================
 
-if raw_data.empty:
+if data_raw.empty:
 
     st.error(
         "❌ Data hotspot tidak berhasil diperoleh."
     )
 
-    st.info(
-        """
-        Kemungkinan penyebab:
+    st.info("""
+Kemungkinan penyebab:
 
-        1. MAP_KEY tidak valid
-        2. NASA FIRMS sedang mengalami gangguan
-        3. Data pada periode tersebut belum tersedia
-        4. Koneksi internet bermasalah
-        """
-    )
+• MAP_KEY tidak valid
+• NASA FIRMS sedang mengalami gangguan
+• Data belum tersedia
+• Koneksi internet bermasalah
+
+Periksa juga pesan HTTP Status di atas.
+""")
 
     st.stop()
 
 
 # ============================================================
-# AGREGASI HARIAN
+# AGREGASI
 # ============================================================
 
-harian = agregasi_harian(
-    raw_data
+data_harian = agregasi_harian(
+    data_raw
 )
 
 
-if harian.empty:
+if data_harian.empty:
 
     st.error(
-        "❌ Tidak terdapat data harian."
+        "❌ Data hotspot harian tidak tersedia."
     )
 
     st.stop()
@@ -692,8 +660,8 @@ if harian.empty:
 # ANALISIS
 # ============================================================
 
-hasil = analisis(
-    harian,
+df = analisis(
+    data_harian,
     BASELINE_DAYS,
     SIGMA_K,
     WINDOW_SIZE,
@@ -707,32 +675,31 @@ hasil = analisis(
 # KPI
 # ============================================================
 
-total_hotspot = len(
-    raw_data
+total_hotspot = int(
+    df["hotspot"].sum()
 )
-
 
 rata_rata = (
-    hasil["hotspot"]
-    .mean()
+    df["hotspot"].mean()
 )
 
-
-hotspot_terakhir = (
-    hasil["hotspot"]
-    .iloc[-1]
+hotspot_terakhir = int(
+    df.iloc[-1]["hotspot"]
 )
 
-
-total_anomali = (
-    hasil["anomali_z"]
-    .sum()
+# ANOMALI UTAMA = c' LANEY
+total_anomali = int(
+    df["anomali_laney"].sum()
 )
 
 
 # ============================================================
-# TAMPILKAN KPI
+# HEADER KPI
 # ============================================================
+
+st.subheader(
+    "📊 Ringkasan Data"
+)
 
 col1, col2, col3, col4 = st.columns(4)
 
@@ -769,63 +736,118 @@ with col4:
     )
 
 
+st.caption(
+    "Total hotspot merupakan jumlah deteksi hotspot satelit, "
+    "bukan jumlah kejadian kebakaran."
+)
+
+
+# ============================================================
+# STATUS TERAKHIR
+# ============================================================
+
 st.divider()
+
+tanggal_terakhir = (
+    df.iloc[-1]["tanggal"]
+)
+
+status_terakhir = (
+    "⚠️ ANOMALI"
+    if df.iloc[-1]["anomali_laney"]
+    else "✅ NORMAL"
+)
+
+
+st.subheader(
+    "📍 Status Hotspot Terakhir"
+)
+
+col1, col2, col3 = st.columns(3)
+
+
+with col1:
+
+    st.write(
+        "**Tanggal:**"
+    )
+
+    st.write(
+        tanggal_terakhir.strftime(
+            "%d %B %Y"
+        )
+    )
+
+
+with col2:
+
+    st.write(
+        "**Jumlah Hotspot:**"
+    )
+
+    st.write(
+        f"{hotspot_terakhir:,}"
+    )
+
+
+with col3:
+
+    st.write(
+        "**Status c' Laney:**"
+    )
+
+    st.write(
+        status_terakhir
+    )
 
 
 # ============================================================
 # GRAFIK c' LANEY
 # ============================================================
 
+st.divider()
+
 st.subheader(
-    "📈 Pergerakan Hotspot dan Bagan Kendali c' Laney"
+    "📈 Bagan Kendali c' Laney"
 )
 
+fig_laney = go.Figure()
 
-fig = go.Figure()
 
-
-# Hotspot harian
-
-fig.add_trace(
+fig_laney.add_trace(
     go.Scatter(
-        x=hasil["tanggal"],
-        y=hasil["hotspot"],
+        x=df["tanggal"],
+        y=df["hotspot"],
         mode="lines+markers",
-        name="Hotspot Harian"
+        name="Hotspot"
     )
 )
 
 
-# Center Line
-
-fig.add_trace(
+fig_laney.add_trace(
     go.Scatter(
-        x=hasil["tanggal"],
-        y=hasil["CL"],
-        mode="lines",
-        name="CL"
-    )
-)
-
-
-# Upper Control Limit
-
-fig.add_trace(
-    go.Scatter(
-        x=hasil["tanggal"],
-        y=hasil["UCL"],
+        x=df["tanggal"],
+        y=df["UCL"],
         mode="lines",
         name="UCL"
     )
 )
 
 
-# Lower Control Limit
-
-fig.add_trace(
+fig_laney.add_trace(
     go.Scatter(
-        x=hasil["tanggal"],
-        y=hasil["LCL"],
+        x=df["tanggal"],
+        y=df["CL"],
+        mode="lines",
+        name="CL"
+    )
+)
+
+
+fig_laney.add_trace(
+    go.Scatter(
+        x=df["tanggal"],
+        y=df["LCL"],
         mode="lines",
         name="LCL"
     )
@@ -833,55 +855,66 @@ fig.add_trace(
 
 
 # Titik anomali
-
-anomali = hasil[
-    hasil["anomali_z"]
+anomali_df = df[
+    df["anomali_laney"]
 ]
 
 
-if not anomali.empty:
+if not anomali_df.empty:
 
-    fig.add_trace(
+    fig_laney.add_trace(
         go.Scatter(
-            x=anomali["tanggal"],
-            y=anomali["hotspot"],
+            x=anomali_df["tanggal"],
+            y=anomali_df["hotspot"],
             mode="markers",
             name="Anomali"
         )
     )
 
 
-fig.update_layout(
+fig_laney.update_layout(
     xaxis_title="Tanggal",
     yaxis_title="Jumlah Hotspot",
     hovermode="x unified",
-    height=550,
-    legend_title="Keterangan"
+    height=500
 )
 
 
 st.plotly_chart(
-    fig,
+    fig_laney,
     use_container_width=True
 )
+
+
+st.info("""
+**Interpretasi c' Laney:**
+
+Suatu hari dikategorikan sebagai anomali apabila jumlah hotspot
+berada di atas batas kendali atas (UCL) atau di bawah batas
+kendali bawah (LCL).
+
+Dalam dashboard ini, c' Laney digunakan sebagai metode utama
+untuk menentukan Total Anomali.
+""")
 
 
 # ============================================================
 # GRAFIK Z-SCORE
 # ============================================================
 
-st.subheader(
-    "📊 Deteksi Anomali Berdasarkan Z-Score"
-)
+st.divider()
 
+st.subheader(
+    "📊 Analisis Z-Score"
+)
 
 fig_z = go.Figure()
 
 
 fig_z.add_trace(
     go.Scatter(
-        x=hasil["tanggal"],
-        y=hasil["z_score"],
+        x=df["tanggal"],
+        y=df["z_score"],
         mode="lines+markers",
         name="Z-Score"
     )
@@ -891,25 +924,28 @@ fig_z.add_trace(
 fig_z.add_hline(
     y=Z_THRESH,
     line_dash="dash",
-    annotation_text=(
-        f"Batas Atas +{Z_THRESH}"
-    )
+    annotation_text=f"+{Z_THRESH}"
 )
 
 
 fig_z.add_hline(
     y=-Z_THRESH,
     line_dash="dash",
-    annotation_text=(
-        f"Batas Bawah -{Z_THRESH}"
-    )
+    annotation_text=f"-{Z_THRESH}"
+)
+
+
+fig_z.add_hline(
+    y=0,
+    line_dash="dot"
 )
 
 
 fig_z.update_layout(
     xaxis_title="Tanggal",
     yaxis_title="Z-Score",
-    height=400
+    hovermode="x unified",
+    height=450
 )
 
 
@@ -919,118 +955,158 @@ st.plotly_chart(
 )
 
 
-# ============================================================
-# HASIL POLA
-# ============================================================
-
-st.subheader(
-    "🔎 Hasil Deteksi Pola"
+jumlah_anomali_z = int(
+    df["anomali_z"].sum()
 )
 
 
-col1, col2, col3 = st.columns(3)
+st.write(
+    f"📌 Berdasarkan Z-Score, terdapat "
+    f"**{jumlah_anomali_z} hari** yang melewati "
+    f"threshold ±{Z_THRESH}."
+)
+
+
+# ============================================================
+# MOVING AVERAGE
+# ============================================================
+
+st.divider()
+
+st.subheader(
+    f"📉 Moving Average ({WINDOW_SIZE} Hari)"
+)
+
+fig_ma = go.Figure()
+
+
+fig_ma.add_trace(
+    go.Scatter(
+        x=df["tanggal"],
+        y=df["hotspot"],
+        mode="lines",
+        name="Hotspot"
+    )
+)
+
+
+fig_ma.add_trace(
+    go.Scatter(
+        x=df["tanggal"],
+        y=df["moving_average"],
+        mode="lines",
+        name=f"MA {WINDOW_SIZE} Hari"
+    )
+)
+
+
+fig_ma.update_layout(
+    xaxis_title="Tanggal",
+    yaxis_title="Jumlah Hotspot",
+    hovermode="x unified",
+    height=450
+)
+
+
+st.plotly_chart(
+    fig_ma,
+    use_container_width=True
+)
+
+
+# ============================================================
+# DETEKSI TREND
+# ============================================================
+
+st.divider()
+
+st.subheader(
+    "📈 Deteksi Tren Hotspot"
+)
+
+trend_terakhir = df.iloc[-1][
+    "kategori_trend"
+]
+
+nilai_trend = df.iloc[-1][
+    "trend"
+]
+
+
+col1, col2 = st.columns(2)
 
 
 with col1:
 
-    jumlah_laney = (
-        hasil["anomali_laney"]
-        .sum()
-    )
-
     st.metric(
-        "Anomali c' Laney",
-        f"{jumlah_laney:,}"
+        "Trend Terakhir",
+        trend_terakhir
     )
 
 
 with col2:
 
-    trend_naik = (
-        hasil["trend_naik"]
-        .sum()
-    )
-
     st.metric(
-        "📈 Trend Naik",
-        f"{trend_naik:,}"
-    )
-
-
-with col3:
-
-    trend_turun = (
-        hasil["trend_turun"]
-        .sum()
-    )
-
-    st.metric(
-        "📉 Trend Turun",
-        f"{trend_turun:,}"
+        "Kemiringan Trend",
+        f"{nilai_trend:,.2f}"
+        if pd.notna(nilai_trend)
+        else "N/A"
     )
 
 
 # ============================================================
-# STATUS TERAKHIR
+# DETEKSI POLA
 # ============================================================
+
+st.divider()
 
 st.subheader(
-    "📌 Status Hotspot Terakhir"
+    "🔎 Deteksi Pola Anomali Berurutan"
 )
 
+pola_df = df[
+    df["pola_laney"]
+]
 
-terakhir = hasil.iloc[-1]
 
+if pola_df.empty:
 
-if bool(terakhir["anomali_z"]):
-
-    st.warning(
-        """
-        ⚠️ **Hari terakhir terdeteksi sebagai anomali
-        berdasarkan Z-Score.**
-        """
+    st.success(
+        "✅ Tidak ditemukan anomali c' Laney "
+        f"yang terjadi selama minimal "
+        f"{MIN_CONSECUTIVE} hari berturut-turut."
     )
-
-
-elif bool(terakhir["anomali_laney"]):
-
-    st.warning(
-        """
-        ⚠️ **Hari terakhir berada di luar batas
-        kendali c' Laney.**
-        """
-    )
-
 
 else:
 
-    st.success(
-        """
-        ✅ **Jumlah hotspot hari terakhir masih
-        berada dalam pola normal.**
-        """
+    st.warning(
+        f"⚠️ Terdapat {len(pola_df)} titik "
+        "yang termasuk rangkaian anomali."
     )
 
 
 # ============================================================
-# TABEL HASIL ANALISIS
+# TABEL ANALISIS
 # ============================================================
+
+st.divider()
 
 st.subheader(
     "📋 Tabel Hasil Analisis"
 )
 
-
-tabel = hasil[
+tabel = df[
     [
         "tanggal",
         "hotspot",
-        "moving_average",
+        "CL",
+        "UCL",
+        "LCL",
+        "anomali_laney",
         "z_score",
         "anomali_z",
-        "anomali_laney",
-        "trend_naik",
-        "trend_turun"
+        "moving_average",
+        "kategori_trend"
     ]
 ].copy()
 
@@ -1041,16 +1117,40 @@ tabel["tanggal"] = (
 )
 
 
+tabel["anomali_laney"] = (
+    tabel["anomali_laney"]
+    .map(
+        {
+            True: "⚠️ Ya",
+            False: "Normal"
+        }
+    )
+)
+
+
+tabel["anomali_z"] = (
+    tabel["anomali_z"]
+    .map(
+        {
+            True: "⚠️ Ya",
+            False: "Normal"
+        }
+    )
+)
+
+
 tabel = tabel.rename(
     columns={
         "tanggal": "Tanggal",
         "hotspot": "Hotspot",
-        "moving_average": "Moving Average",
+        "CL": "CL",
+        "UCL": "UCL",
+        "LCL": "LCL",
+        "anomali_laney": "Anomali c' Laney",
         "z_score": "Z-Score",
         "anomali_z": "Anomali Z-Score",
-        "anomali_laney": "Anomali c' Laney",
-        "trend_naik": "Trend Naik",
-        "trend_turun": "Trend Turun"
+        "moving_average": "Moving Average",
+        "kategori_trend": "Trend"
     }
 )
 
@@ -1066,12 +1166,14 @@ st.dataframe(
 # DATA MENTAH
 # ============================================================
 
+st.divider()
+
 with st.expander(
-    "📂 Lihat Data Mentah NASA FIRMS"
+    "📄 Lihat Data Hotspot Mentah"
 ):
 
     st.dataframe(
-        raw_data,
+        data_raw,
         use_container_width=True,
         hide_index=True
     )
@@ -1081,60 +1183,34 @@ with st.expander(
 # INFORMASI METODE
 # ============================================================
 
-with st.expander(
-    "ℹ️ Tentang Dashboard"
-):
+st.divider()
 
-    st.markdown(
-        """
-        ### 🛰️ Sumber Data
+st.subheader(
+    "📚 Metode yang Digunakan"
+)
 
-        **NASA FIRMS (Fire Information for Resource Management System)**
+st.markdown("""
+### 1. Bagan Kendali c' Laney
+Digunakan sebagai **metode utama** untuk mengetahui apakah
+jumlah hotspot harian masih berada dalam batas kendali statistik.
 
-        Sensor yang digunakan:
+- **CL** = Center Line
+- **UCL** = Upper Control Limit
+- **LCL** = Lower Control Limit
+- Titik di luar UCL/LCL dikategorikan sebagai **anomali**.
 
-        **VIIRS SNPP Near Real-Time (VIIRS_SNPP_NRT)**
+### 2. Z-Score
+Digunakan untuk mengetahui seberapa jauh jumlah hotspot
+menyimpang dari rata-rata dalam satuan standar deviasi.
 
-        Wilayah:
+### 3. Moving Average
+Digunakan untuk melihat kecenderungan atau pola pergerakan
+jumlah hotspot dari waktu ke waktu.
 
-        **Indonesia**
-
-        ### 📊 Metode Statistik
-
-        Dashboard menggunakan beberapa metode:
-
-        **1. Bagan Kendali c' Laney**
-
-        Digunakan untuk melihat apakah jumlah hotspot
-        harian berada dalam batas kendali statistik.
-
-        **2. Z-Score**
-
-        Digunakan untuk mengidentifikasi hari dengan
-        jumlah hotspot yang menyimpang dari pola umum.
-
-        **3. Moving Average**
-
-        Digunakan untuk melihat pola rata-rata hotspot
-        dalam beberapa hari.
-
-        **4. Trend Detection**
-
-        Digunakan untuk mengidentifikasi kecenderungan
-        hotspot meningkat atau menurun.
-
-        **5. Sequence Detection**
-
-        Digunakan untuk melihat pola anomali yang terjadi
-        secara berturut-turut.
-
-        ### ⚠️ Catatan
-
-        Satu hotspot merupakan satu titik deteksi satelit,
-        sehingga **1 hotspot tidak selalu berarti 1 kejadian
-        kebakaran**.
-        """
-    )
+### 4. Deteksi Pola
+Digunakan untuk mengetahui apakah kondisi anomali terjadi
+secara berurutan selama beberapa hari.
+""")
 
 
 # ============================================================
@@ -1144,6 +1220,6 @@ with st.expander(
 st.divider()
 
 st.caption(
-    "🔥 Dashboard Analisis Hotspot Kebakaran Indonesia | "
-    "NASA FIRMS | Statistika Big Data"
+    "Sumber data: NASA FIRMS | "
+    "Analisis statistik: c' Laney, Z-Score, Moving Average"
 )
